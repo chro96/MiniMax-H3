@@ -19,6 +19,79 @@ python3 -m studio --port 8791 --data-dir data/my-studio
 
 macOSで動画処理ツールが未導入なら `brew install ffmpeg`。Studioは127.0.0.1にバインドし、ローカルの制作画面として使用します。同じ保存先で二つのStudioを起動すると、ワーカーのロックで重複実行を防ぎます。
 
+### Windows
+
+Python 3.10以降と、`ffmpeg.exe` / `ffprobe.exe` を導入し、PATHから実行できる状態にします。PowerShellでプロジェクトのフォルダへ移動して起動します:
+
+```powershell
+cd C:\path\to\miniMaxLocal
+py -3 --version
+ffmpeg -version
+ffprobe -version
+if (-not (Test-Path .env.studio)) { Copy-Item .env.studio.example .env.studio }
+py -3 -m studio
+```
+
+Studioの排他ロックはWindowsでは`msvcrt`、macOS/Linuxでは`fcntl`を使用します。デモの文字描画にはWindowsのArialまたはSegoe UIを指定します。PowerShellのUTF-8（BOMあり・なし）とUTF-16形式の `.env.studio` を読み込めます。同じポートの二重起動をWindowsの排他ソケットで防ぎ、JS/CSSの配信形式はOSのレジストリ設定に依存しません。Windowsネイティブの実機テストは未実施です。
+
+### すでに動いているComfyUI H3に接続
+
+既存環境で生成できているワークフローをそのまま使います。Studioはモデルをダウンロードせず、モデル・量子化・解像度・steps・オフロード設定を変更しません。RTX 3060 12GB / RAM 32GBなどで動作済みの構成も、まずその設定を使って接続してください。
+
+1. WindowsでいつものComfyUIを起動し、H3のワークフローを開きます。
+2. ComfyUIの **Export (API)** でJSONを保存します。通常の画面用ワークフローJSON（`nodes` / `links`を持つ形式）は実行できません。API形式のエクスポートが見えない場合はComfyUIの設定で開発者向けオプションを有効にします。
+3. Studioを起動して「生成環境の設定」→ **APIワークフローを読み込む** からJSONを選択します。
+4. **接続を確認** でComfyUIと必要なノードの存在を確認します。この操作は生成を投入しません。モデルファイルの有無や推論の成功は実生成で確認してください。
+5. プロジェクトの生成先を **ComfyUI H3（既存のワークフロー）** にして、カットを生成します。テキスト用ワークフローが設定済みなら、次回起動からComfyUIが初期選択されます。
+
+同じWindows PCなら通常の接続先は `http://127.0.0.1:8188` です。ポートが異なる場合だけ `.env.studio` を変更してStudioを再起動します:
+
+```dotenv
+COMFYUI_BASE_URL=http://127.0.0.1:8188
+COMFYUI_API_KEY=
+COMFYUI_POLL_SECONDS=3
+COMFYUI_TIMEOUT_SECONDS=7200
+```
+
+Studioは[ComfyUI公式のHTTP API](https://docs.comfy.org/development/comfyui-server/comms_routes)の `/prompt`、`/history/{prompt_id}`、`/queue`、`/view`、`/upload/image` を使います。各カットを順に投入し、結果をStudioの保存先へコピーします。WebM/AV1などの出力も、プレビュー用のH.264/AAC MP4へ変換して保存します。
+
+[標準のMiniMax H3ノード](https://github.com/Comfy-Org/ComfyUI/blob/master/comfy_extras/nodes_minimax_h3.py)ではプロンプト・フレーム数・seed・動画保存先を自動検出します。24fpsでカットの尺を満たす `17k+5` フレームへ切り上げ、合成時に各カットを指定フレーム数へ切り詰めます。幅・高さは動作済みワークフローの値を保持します。最終動画はプロジェクトの比率へフィットするため、ワークフローと異なる比率なら余白が入ります。
+
+**参照画像を使う場合**は、Ref2VAの動作済みワークフローも読み込みます。キャラクター画像とコマ画像の合計枚数に合うものを画像数ごとに保存できます。たとえばキャラクター参照1枚なら1枚用、さらにコマの構図画像1枚を使うなら2枚用です。標準Ref2VAの各画像入力が `LoadImage` に直接つながっていれば自動検出します。前処理やカスタムノードを経由する場合は次の `references` で元の画像入力を指定します。画像はアップロードするので、ComfyUIとの共有フォルダは不要です。
+
+#### カスタムノードの入力先を指定する
+
+自動検出できないワークフローは、API形式JSONを `workflow` に入れ、差し替える入力先を `bindings` に指定したJSONを読み込みます。GGUFなどのカスタムノードも同じ方式で使えます。次の例のID・入力名は例示です。実際に動いているAPI形式JSONのID・入力名に合わせてください:
+
+```json
+{
+  "workflow": {
+    "12": {"class_type": "YourWorkingH3Node", "inputs": {"prompt": "old prompt", "length": 124, "seed": 1, "width": 352, "height": 608}},
+    "30": {"class_type": "YourWorkingVideoSaveNode", "inputs": {"video": ["12", 0], "filename_prefix": "video/H3", "fps": 24}}
+  },
+  "output_node": "30",
+  "bindings": {
+    "prompt": [["12", "prompt"]],
+    "frames": [["12", "length"]],
+    "seed": [["12", "seed"]],
+    "fps": [["30", "fps"]],
+    "output_prefix": [["30", "filename_prefix"]],
+    "references": []
+  }
+}
+```
+
+- 必須: `prompt`、`seed`、`frames`または`seconds`。`frames`はH3の17k+5フレーム、`seconds`はコマの指定秒数を渡します。
+- 任意: `fps`、`output_prefix`、`references`。`references`の入力先は画像ファイル名を受け取る入力で、配列の順番が `<Picture 1>`、`<Picture 2>` に対応します。
+- `output_node`は完成した動画を保存するノードIDです。標準の `SaveVideo` / `VHS_VideoCombine` が一つなら自動判別します。複数あれば指定してください。対象ノードにつながる部分だけを投入し、別の保存ノードに向けた無関係の生成を実行しません。
+- カスタム保存ノードは、ComfyUIの実行履歴の `videos` / `images` / `gifs` に `filename` / `subfolder` / `type: "output"` を持つMP4/WebM/MKV/MOVを一つ返す必要があります。バッチサイズは1にします。
+- 入力がPrimitiveノードにつながっている場合は元の値を変更します。それ以外の連結は自動で上書きせず、`bindings`で値を持つ入力を指定する必要があります。
+- ワークフローにAPIキーや認証情報を含めないでください。ComfyUIのHTTP認証は `COMFYUI_API_KEY` へ設定します。
+
+読込済みワークフローは `data/studio/comfy/` に保存します。同じ画像数の設定を読み込み直すと、以前の設定を `comfy/history/` に保持します。設定画面の「以前のワークフローに戻す」から復元できます。ファイルで設定する場合は `COMFYUI_WORKFLOW_PATH=C:/workflows/h3-api.json`、参照用は `COMFYUI_REF_WORKFLOW_PATH=C:/workflows/h3-ref-{count}.json` などを指定できます。画面から読み込んだ設定が優先されます。各テイクは投入時のワークフローと照合ハッシュを保持するため、設定を変更しても待機・回収中のテイクは元の設定で処理します。
+
+ワークフロー設定の変更だけでは、過去の完了テイクを本文不一致にしません。新しいモデル・設定で撮り直す場合は「この本文で再生成」を選びます。コマの本文を変更したときは通常どおり不一致を判定します。
+
 ## 最初に試す
 
 1. 「新規制作」でタイトルとアイデアを入力。標準は **5カット × 6秒**。6×5、3×10、2×15も選択できます。
@@ -31,7 +104,7 @@ macOSで動画処理ツールが未導入なら `brew install ffmpeg`。Studio�
 
 デモは操作とメディア処理の検証用です。ロボットなどのAI映像は描画しません。デモの完成版は承認できず、H3映像と混在して合成できません。
 
-## H3で映像を生成
+## SGLang H3で映像を生成
 
 Studioは**既に起動しているSGLang H3サーバー**に接続します。Mac上で制作画面を動かし、別のGPUマシンで推論を動かす構成でも利用できます。Studio起動だけではモデルをダウンロードしたりGPUを確保したりしません。
 
@@ -54,7 +127,7 @@ H3_TIMEOUT_SECONDS=3600
 - 画像は `conditions` のData URIとして送信するため、Studioと推論サーバーの間でファイルパスを共有する必要はありません。
 - POST `/v1/videos` → GET `/v1/videos/{id}` → GET `/v1/videos/{id}/content` の非同期APIを利用します。
 
-H3の1回の出力は4〜15秒です。Studioはカットに分割し、合計30秒の構成を生成・合成します。GPUの種類とメモリに合わせたサーバー起動方法は、[SGLang公式H3ガイド](https://docs.sglang.io/cookbook/diffusion/MiniMax/MiniMax-H3) とこのリポジトリの [ローカルデプロイ説明](../README.ja.md#h3-base-のローカルデプロイ) を参照してください。最初のバージョンの接続先はSGLangです。ip-short-makerのColab自動確保・停止処理は移植していません。
+H3の1回の出力は4〜15秒です。Studioはカットに分割し、合計30秒の構成を生成・合成します。GPUの種類とメモリに合わせたサーバー起動方法は、[SGLang公式H3ガイド](https://docs.sglang.io/cookbook/diffusion/MiniMax/MiniMax-H3) とこのリポジトリの [ローカルデプロイ説明](../README.ja.md#h3-base-のローカルデプロイ) を参照してください。ip-short-makerのColab自動確保・停止処理は移植していません。
 
 ## アイデアからAIでコマ割り・部分修正
 
@@ -89,7 +162,7 @@ AI未設定でも、空のコマ割り・サンプル・手動編集・JSON読�
 | 編集へ戻す | 承認を解除して修正可能にする。完成版と履歴は保持 |
 | アーカイブ / 復元 | 通常表示から外す / 戻す。データは削除しない |
 
-各テイクに、生成時の本文・全体設定・実投入プロンプト・seed・生成先・H3ジョブIDを保存します。現在の本文から組み立てた入力と照合し、一致・不一致を表示します。日本語のメモと音声消去など合成だけの設定は、動画再生成の不一致判定に含めません。
+各テイクに、生成時の本文・全体設定・実投入プロンプト・seed・生成先・生成ジョブIDを保存します。現在の本文から組み立てた入力と照合し、一致・不一致を表示します。日本語のメモと音声消去など合成だけの設定は、動画再生成の不一致判定に含めません。
 
 カットの終端状態は次のカットのプロンプトに入ります。その終端を直すと次のカットも不一致になります。全体の画風・キャラクター・世界観などを直すと全カットが不一致になります。これはテキストによる連続性の指定であり、前の生成動画の最終フレームを自動投入する機能ではありません。
 
@@ -111,6 +184,7 @@ AI未設定でも、空のコマ割り・サンプル・手動編集・JSON読�
 data/studio/
   studio.sqlite3             プロジェクト・ジョブ・テイク・構成の正本
   worker.lock                同じ保存先のワーカー重複起動を防止
+  comfy/*.json               読込済みComfyUIのAPIワークフロー
   assets/<id>.*              参照画像・BGM
   takes/<id>/raw.mp4         各テイクの映像
   takes/<id>/thumb.jpg       代表フレーム
@@ -124,13 +198,16 @@ data/studio/
 ## ジョブの中断・失敗
 
 - 一つのワーカーで順番に生成・合成します。処理中の同プロジェクトの編集・再投入・状態変更を拒否します。
-- Studio停止時にH3の受付済みジョブIDを保存。再起動すると同じIDの状態確認・回収を続けます。新規POSTは行いません。
+- Studio停止時にH3 / ComfyUIの受付済みジョブIDを保存。再起動すると同じIDの状態確認・回収を続けます。新規POSTは行いません。
+- 一時的なComfyUIの通信失敗は最大5回、間隔を延ばして再確認します。ワークフローのHTTP 4xx拒否は受付されていないことを表示し、ノードの検証エラーを伝えます。
+- 受付IDはSQLiteへの記録前に、テイクごとの `remote-job.json` に入力ハッシュと合わせて保存します。DB書込が失敗しても、次回起動時に同じ入力のIDを回復できます。両方の保存が失敗した場合はターミナルに受付IDを出します。
 - 待機のタイムアウトや回収失敗時には、テイク履歴の「同じジョブを回収」で追加生成せず結果を再取得できます。
-- POSTの受付後、ジョブID保存前に異常終了した場合は受付結果が不明です。自動再投入せず失敗を記録します。H3サーバー側のジョブ一覧を確認してください。
+- POSTの受付後、ジョブID保存前に異常終了した場合は受付結果が不明です。自動再投入せず失敗を記録します。H3サーバーまたはComfyUIのキュー・履歴を確認してください。
 - 部分失敗でも先に完了したテイクは保存します。失敗・未生成カットを再生成して続行できます。
 - 一つのカットが失敗しても残りのカットを処理し、失敗したカット番号をジョブへ記録します。撮り直し後に使用テイクの選択が必要な場合、処理履歴へ表示します。
-- 通常の終了操作ではH3受付処理とジョブID保存の完了を待ちます。実行中のffmpegは終了・回収し、合成途中の未登録ディレクトリは次回起動時に整理します。
-- Studioを停止してもH3サーバーの推論やGPUそのものは停止しません。サーバーの稼働管理は別途行ってください。
+- 通常の終了操作では生成先の受付処理とジョブID保存の完了を待ちます。実行中のffmpegは終了・回収し、合成途中の未登録ディレクトリは次回起動時に整理します。
+- Ctrl+C / Ctrl+Breakで通常停止します。停止待ち中にもう一度押すと強制終了します。受付ID保存前の強制終了では、生成先のキューを確認してから再投入してください。
+- Studioを停止してもH3 / ComfyUIの推論やGPUそのものは停止しません。サーバーの稼働管理は別途行ってください。
 
 ## コマ割りJSONの読込
 

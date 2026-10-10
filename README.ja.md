@@ -33,7 +33,7 @@ python3 -m studio
 # → http://127.0.0.1:8790
 ```
 
-Python標準ライブラリとffmpegで動作します。H3サーバー未接続でもデモで一連の操作を試せます。AIコマ割りと実映像の生成には、それぞれテキストモデルとH3推論サーバーの設定が必要です。起動・設定・部分修正の手順は [docs/studio.md](docs/studio.md) を参照してください。
+Python標準ライブラリとffmpegで動作します。Windowsでは `py -3 -m studio` で起動できます。既存のComfyUI H3は、動作済みのAPIワークフローを設定画面から読み込んで利用できます。SGLang H3への接続も利用可能です。未接続でもデモで一連の操作を試せます。起動・設定・部分修正の手順は [docs/studio.md](docs/studio.md) を参照してください。
 
 ## プロンプト作成スキル
 

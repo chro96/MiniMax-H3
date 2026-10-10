@@ -26,7 +26,7 @@
 
 ## MiniMax Local Studio
 
-Run `python3 -m studio` and open `http://127.0.0.1:8790` for a local 30-second video workflow: storyboards, per-cut H3 generation, partial retakes, take history, BGM assembly, review and a video library. The Studio uses Python's standard library plus ffmpeg; GPU-free demo generation is available. Real video generation requires an existing SGLang H3 server. Optional AI storyboards use a configured Chat Completions-compatible text model. See [the Studio guide](docs/studio.md) for setup and limitations.
+Run `python3 -m studio` (Windows: `py -3 -m studio`) and open `http://127.0.0.1:8790` for a local 30-second video workflow: storyboards, per-cut H3 generation, partial retakes, take history, BGM assembly, review and a video library. The Studio uses Python's standard library plus ffmpeg; GPU-free demo generation is available. Connect an existing ComfyUI H3 installation by importing a working API workflow, or use a SGLang H3 server. Optional AI storyboards use a configured Chat Completions-compatible text model. See [the Studio guide](docs/studio.md) for setup and limitations.
 
 ## Prompt Writing Skill
 

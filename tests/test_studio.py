@@ -5,6 +5,8 @@ import json
 import os
 import shutil
 import sys
+import subprocess
+from types import SimpleNamespace
 import tempfile
 import threading
 import unittest
@@ -19,6 +21,8 @@ from studio.domain import compile_cut, new_id, template, validate_document
 from studio.providers import H3
 from studio.server import Server
 from studio.service import Conflict, Store, Worker
+from studio.locking import FileLock
+from studio import locking
 
 
 def filled(doc):
@@ -202,6 +206,23 @@ class StoreTests(StoreFixture):
 
 @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "ffmpeg is required")
 class MediaLifecycleTests(StoreFixture):
+    def test_windows_demo_font_path_handles_colon_and_spaces(self):
+        candidates = [Path(os.environ.get("SystemRoot","C:/Windows"))/"Fonts"/"arial.ttf",
+            Path("/System/Library/Fonts/Supplemental/Arial.ttf"),
+            Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")]
+        font = next((candidate for candidate in candidates if candidate.is_file()),None)
+        if font is None:
+            self.skipTest("No test font installed")
+        system = self.store.root / "C:" / "Windows with spaces"
+        fonts = system / "Fonts"
+        fonts.mkdir(parents=True)
+        shutil.copyfile(font,fonts/"arial.ttf")
+        output = self.store.root / "windows-demo.mp4"
+        with patch.object(media,"os",SimpleNamespace(name="nt",environ={"SystemRoot":str(system)})):
+            media.demo(output,0.25,0,0)
+        metadata = media.probe(output)
+        self.assertEqual(int(next(s for s in metadata["streams"] if s["codec_type"] == "video")["nb_frames"]),6)
+
     def test_fractional_cuts_assemble_at_exact_frame_boundaries(self):
         doc = copy.deepcopy(self.project["document"])
         doc["cuts"][0]["seconds"] = 6.0416666683
@@ -346,6 +367,91 @@ class MediaLifecycleTests(StoreFixture):
 
 
 class RecoveryTests(StoreFixture):
+    def test_force_stop_reaps_isolated_children_and_blocks_new_processes(self):
+        started = threading.Event()
+        children, failures = [], []
+        original = subprocess.Popen
+        def spawn(*args, **kwargs):
+            child = original(*args, **kwargs)
+            children.append(child)
+            started.set()
+            return child
+        def running():
+            try:
+                media.run([sys.executable, "-c", "import time;time.sleep(20)"])
+            except (RuntimeError, InterruptedError) as exc:
+                failures.append(exc)
+        thread = threading.Thread(target=running)
+        with patch.object(media, "_terminating", False), patch.object(media.subprocess, "Popen", side_effect=spawn):
+            try:
+                thread.start()
+                self.assertTrue(started.wait(3))
+                media.kill_children()
+                thread.join(3)
+                self.assertFalse(thread.is_alive())
+                self.assertIsNotNone(children[0].returncode)
+                self.assertTrue(failures)
+                with self.assertRaises(InterruptedError):
+                    media.run([sys.executable, "-c", "print('should not start')"])
+                self.assertEqual(len(children), 1)
+                self.assertFalse(media._children)
+            finally:
+                for child in children:
+                    if child.poll() is None:
+                        child.kill()
+                thread.join(3)
+
+    def test_busy_orphan_cleanup_does_not_block_startup(self):
+        orphan = self.store.root / "renders" / new_id()
+        orphan.mkdir(parents=True)
+        worker = Worker(self.store)
+        with patch("studio.service.shutil.rmtree", side_effect=PermissionError("in use")), self.assertLogs(level="WARNING"):
+            try:
+                worker.start()
+                self.assertTrue(worker.thread.is_alive())
+                self.assertTrue(orphan.is_dir())
+            finally:
+                worker.close()
+
+    def test_worker_lease_excludes_other_process_and_releases(self):
+        leasefile = self.store.root / "worker.lock"
+        lease = FileLock.acquire(leasefile)
+        script = """import sys
+from studio.locking import FileLock
+try:
+    lease = FileLock.acquire(sys.argv[1])
+except BlockingIOError:
+    sys.exit(12)
+lease.close()
+"""
+        try:
+            child = subprocess.run([sys.executable,"-c",script,str(leasefile)],capture_output=True,timeout=5)
+            self.assertEqual(child.returncode,12,child.stderr.decode())
+        finally:
+            lease.close()
+        lease.close()
+        child = subprocess.run([sys.executable,"-c",script,str(leasefile)],capture_output=True,timeout=5)
+        self.assertEqual(child.returncode,0,child.stderr.decode())
+
+    def test_windows_lease_locks_a_persistent_byte_at_offset_zero(self):
+        calls = []
+        backend = SimpleNamespace(LK_NBLCK=1,LK_UNLCK=0,
+            locking=lambda fd,mode,size:calls.append((mode,size,os.lseek(fd,0,os.SEEK_CUR))))
+        leasefile = self.store.root / "windows.lock"
+        with patch.object(locking,"os",SimpleNamespace(name="nt",fstat=os.fstat)), patch.dict(sys.modules,{"msvcrt":backend}):
+            lease = FileLock.acquire(leasefile)
+            self.assertEqual(leasefile.read_bytes(),b"\0")
+            lease.close()
+            lease.close()
+        self.assertEqual(calls,[(1,1,0),(0,1,0)])
+
+    def test_failed_worker_start_releases_lease(self):
+        worker = Worker(self.store)
+        with patch.object(worker,"recover_journal",side_effect=RuntimeError("recovery failed")):
+            with self.assertRaisesRegex(RuntimeError,"recovery failed"):
+                worker.start()
+        lease = FileLock.acquire(self.store.root / "worker.lock")
+        lease.close()
     def test_shutdown_waits_for_submitted_id_to_be_saved(self):
         submitted, release = threading.Event(), threading.Event()
         class SlowH3:
@@ -379,15 +485,23 @@ class RecoveryTests(StoreFixture):
             worker.close()
 
     def test_media_stop_terminates_and_reaps_child(self):
-        pidfile = self.store.root / "child.pid"
         stop = threading.Event()
+        children = []
+        original = subprocess.Popen
+        def spawn(*args,**kwargs):
+            child = original(*args,**kwargs)
+            if os.name != "nt":
+                self.assertNotEqual(os.getpgid(child.pid), os.getpgrp())
+            children.append(child)
+            return child
         timer = threading.Timer(0.4,stop.set)
         timer.start()
         try:
-            with self.assertRaises(InterruptedError):
-                media.run([sys.executable,"-c","import os,pathlib,sys,time;pathlib.Path(sys.argv[1]).write_text(str(os.getpid()));time.sleep(20)",str(pidfile)],stop=stop)
-            with self.assertRaises(ProcessLookupError):
-                os.kill(int(pidfile.read_text()),0)
+            with patch.object(media.subprocess,"Popen",side_effect=spawn),self.assertRaises(InterruptedError):
+                media.run([sys.executable,"-c","import time;time.sleep(20)"],stop=stop)
+            self.assertEqual(len(children),1)
+            self.assertIsNotNone(children[0].returncode)
+            children[0].wait(timeout=0.1)
         finally:
             timer.cancel()
 
