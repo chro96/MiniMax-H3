@@ -1,1 +1,7 @@
 *.safetensors
+data/
+.env.studio
+.env.studio.*
+!.env.studio.example
+__pycache__/
+*.pyc
