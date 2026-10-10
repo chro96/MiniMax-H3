@@ -5,12 +5,12 @@ owns an immutable input snapshot. Failed remote jobs may be collected without
 submitting another request, and completed masters always remain accessible.
 """
 import copy
-import fcntl
 import hashlib
 import json
 import logging
 import math
 import os
+import re
 import shutil
 import sqlite3
 import threading
@@ -19,7 +19,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import media
+from .comfy import Comfy
 from .domain import FIELDS, compile_cut, fingerprint, new_id, template, validate_document
+from .locking import FileLock
+from .files import replace
 from .providers import H3, Planner
 
 
@@ -31,7 +34,25 @@ def encode(value):
     return json.dumps(value, ensure_ascii=False)
 
 
+def journal_id(root, take):
+    file = root / "takes" / take["id"] / "remote-job.json"
+    try:
+        value = json.loads(file.read_text(encoding="utf-8"))
+        ident = value.get("external_id")
+        if (value.get("take_id") == take["id"] and value.get("provider") == take["provider"] and
+                value.get("input_sha256") == hashlib.sha256(take["input"].encode()).hexdigest() and
+                isinstance(ident, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,160}", ident)):
+            return ident
+    except (OSError, ValueError, AttributeError):
+        pass
+    return None
+
+
 class Conflict(ValueError):
+    pass
+
+
+class NotFound(LookupError):
     pass
 
 
@@ -105,7 +126,7 @@ class Store:
     def project(self, db, ident):
         row = db.execute("SELECT * FROM projects WHERE id=?", (ident,)).fetchone()
         if not row:
-            raise KeyError("プロジェクトがありません")
+            raise NotFound("プロジェクトがありません")
         result = dict(row)
         result["document"] = validate_document(json.loads(result["document"]))
         return result
@@ -204,7 +225,7 @@ class Store:
                 raise Conflict("素材動画のハッシュが一致しません")
             takes.append({"cut_id": cut["id"], "take_id": row["id"], "revision": row["revision"],
                           "seconds": cut["seconds"], "mute": cut["mute"], "sha256": row["output_sha256"]})
-        if len(kinds) != 1:
+        if "demo" in kinds and len(kinds) != 1:
             raise Conflict("デモとH3のテイクを混ぜて合成できません")
         demo = "demo" in kinds
         if demo and not allow_demo:
@@ -229,6 +250,8 @@ class Store:
             live = {c["id"]: compile_cut(doc, c["id"])["fingerprint"] for c in doc["cuts"]}
             for row in db.execute("SELECT * FROM takes WHERE project_id=? ORDER BY revision DESC", (ident,)):
                 take = dict(row)
+                if not take["external_id"] and take["provider"] in {"h3", "comfy"}:
+                    take["external_id"] = journal_id(self.root, row)
                 take["input"] = json.loads(take["input"])
                 take["matches"] = live.get(take["cut_id"]) == take["fingerprint"]
                 take["selected"] = selected.get(take["cut_id"]) == take["id"]
@@ -311,8 +334,8 @@ class Store:
             payload = {"version": project["version"]}
             if kind == "generate":
                 provider = options.get("provider", "h3")
-                if provider not in {"h3", "demo"}:
-                    raise ValueError("生成先はh3またはdemoです")
+                if provider not in {"h3", "comfy", "demo"}:
+                    raise ValueError("生成先はh3、comfy、demoです")
                 cut_ids = options.get("cut_ids")
                 if not isinstance(cut_ids, list) or not cut_ids or len(cut_ids) != len(set(cut_ids)) or any(c not in {s["id"] for s in doc["cuts"]} for c in cut_ids):
                     raise ValueError("生成するカットが不正です")
@@ -330,6 +353,8 @@ class Store:
                         compiled["request"]["endpoint"] = H3().endpoint(compiled["request"]["task"])
                     revision = db.execute("SELECT COALESCE(MAX(revision),0)+1 FROM takes WHERE project_id=? AND cut_id=?", (ident, cut_id)).fetchone()[0]
                     take_id = new_id()
+                    if provider == "comfy":
+                        compiled["comfy"] = Comfy(self.root).prepare(compiled["request"], take_id)
                     compiled["document"] = copy.deepcopy(doc)
                     assets = self.assets(db, ident)
                     compiled["reference_assets"] = [{"id": ref, "sha256": assets[ref]["sha256"], "name": assets[ref]["name"], "mime": assets[ref]["mime"]} for ref in compiled["request"]["references"]]
@@ -341,9 +366,10 @@ class Store:
                 payload["manifest"] = self.assembly_manifest(db, ident)
             elif kind == "recover":
                 take = db.execute("SELECT * FROM takes WHERE id=? AND project_id=?", (options.get("take_id"), ident)).fetchone()
-                if not take or take["status"] != "failed" or not take["external_id"] or take["provider"] != "h3":
-                    raise ValueError("回収可能なH3ジョブがありません")
-                db.execute("UPDATE takes SET status='queued',error=NULL WHERE id=?", (take["id"],))
+                external_id = (take["external_id"] or journal_id(self.root, take)) if take else None
+                if not take or take["status"] != "failed" or not external_id or take["provider"] not in {"h3", "comfy"}:
+                    raise ValueError("回収可能な生成ジョブがありません")
+                db.execute("UPDATE takes SET status='queued',error=NULL,external_id=? WHERE id=?", (external_id, take["id"]))
                 payload.update({"take_ids": [take["id"]], "auto_assemble": False})
             elif kind in {"plan", "revise"}:
                 if not Planner().available:
@@ -379,23 +405,26 @@ class Store:
 
 
 class Worker:
-    def __init__(self, store, h3=None, planner=None):
+    def __init__(self, store, h3=None, planner=None, comfy=None):
         self.store, self.h3, self.planner = store, h3 or H3(), planner or Planner()
+        self.comfy = comfy
         self.stop = threading.Event()
         self.thread = None
         self.lease = None
 
     def start(self):
-        self.lease = (self.store.root / "worker.lock").open("a+")
         try:
-            fcntl.flock(self.lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.lease = FileLock.acquire(self.store.root / "worker.lock")
         except BlockingIOError as exc:
-            self.lease.close()
             raise RuntimeError("この保存先のStudioはすでに起動しています") from exc
-        self.recover_journal()
-        self.cleanup_renders()
-        self.thread = threading.Thread(target=self.loop, daemon=False, name="studio-worker")
-        self.thread.start()
+        try:
+            self.recover_journal()
+            self.cleanup_renders()
+            self.thread = threading.Thread(target=self.loop, daemon=False, name="studio-worker")
+            self.thread.start()
+        except BaseException:
+            self.lease.close()
+            raise
 
     def cleanup_renders(self):
         with self.store.db() as db:
@@ -404,17 +433,24 @@ class Worker:
         if directory.is_dir():
             for folder in directory.iterdir():
                 if folder.is_dir() and not folder.is_symlink() and len(folder.name) == 32 and all(c in "0123456789abcdef" for c in folder.name) and folder.name not in known:
-                    shutil.rmtree(folder)
+                    try:
+                        shutil.rmtree(folder)
+                    except OSError:
+                        logging.warning("Studio orphan render cleanup deferred: %s", folder.name)
 
     def recover_journal(self):
         with self.store.db() as db:
             # A saved external ID is resumed, never resubmitted. A crash between
             # POST and persisting its response is ambiguous and requires review.
-            for row in db.execute("SELECT * FROM takes WHERE status IN ('running','submitting')").fetchall():
-                if row["status"] == "submitting" and not row["external_id"]:
-                    db.execute("UPDATE takes SET status='failed',error=? WHERE id=?", ("受付結果が不明です。H3サーバーのジョブ一覧を確認してから撮り直してください", row["id"]))
+            for row in db.execute("SELECT * FROM takes WHERE status IN ('running','submitting') OR (status='failed' AND external_id IS NULL)").fetchall():
+                external_id = row["external_id"] or journal_id(self.store.root, row)
+                if row["status"] == "failed":
+                    if external_id:
+                        db.execute("UPDATE takes SET external_id=? WHERE id=?", (external_id, row["id"]))
+                elif row["status"] == "submitting" and not external_id:
+                    db.execute("UPDATE takes SET status='failed',error=? WHERE id=?", ("受付結果が不明です。生成サーバーのキューを確認してから撮り直してください", row["id"]))
                 else:
-                    db.execute("UPDATE takes SET status='queued' WHERE id=?", (row["id"],))
+                    db.execute("UPDATE takes SET status='queued',external_id=? WHERE id=?", (external_id, row["id"]))
             db.execute("UPDATE jobs SET status='queued',stage='再開待機',updated=? WHERE status='running'", (now(),))
 
     def close(self):
@@ -422,7 +458,8 @@ class Worker:
         if self.thread:
             # A POST must finish and persist its ID before the process exits.
             # Media subprocesses observe stop and are terminated/reaped.
-            self.thread.join()
+            while self.thread.is_alive():
+                self.thread.join(0.5)
         if self.lease:
             self.lease.close()
 
@@ -542,27 +579,59 @@ class Worker:
             with self.store.db() as db:
                 db.execute("UPDATE takes SET status='running' WHERE id=?", (take_id,))
             cut_index = next(i for i, c in enumerate(compiled["document"]["cuts"]) if c["id"] == take["cut_id"])
-            media.demo(output, compiled["snapshot"]["seconds"], cut_index, compiled["request"]["seed"], self.stop)
+            temporary = folder / (new_id() + ".demo.mp4")
+            try:
+                media.demo(temporary, compiled["snapshot"]["seconds"], cut_index, compiled["request"]["seed"], self.stop)
+                replace(temporary, output)
+            finally:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    logging.warning("Studio demo temporary file cleanup deferred")
         else:
-            external_id = take["external_id"]
+            provider = (self.comfy or Comfy(self.store.root)) if take["provider"] == "comfy" else self.h3
+            spec = compiled["comfy"] if take["provider"] == "comfy" else compiled["request"]
+            external_id = take["external_id"] or journal_id(self.store.root, take)
             if not external_id:
                 with self.store.db() as db:
                     db.execute("UPDATE takes SET status='submitting' WHERE id=?", (take_id,))
-                external_id = self.h3.submit(compiled["request"], assets)
-                with self.store.db() as db:
-                    db.execute("UPDATE takes SET status='running',external_id=? WHERE id=?", (external_id, take_id))
-            self.h3.collect(compiled["request"], external_id, output, progress, self.stop)
+                external_id = provider.submit(spec, assets)
+                self.persist_external_id(take, external_id)
+            provider.collect(spec, external_id, output, progress, self.stop)
         metadata = media.probe(output, self.stop)
         if media.video_duration(metadata) < compiled["snapshot"]["seconds"] - 0.5:
             raise ValueError("生成結果に有効な指定尺の映像がありません")
         media.thumbnail(output, thumb, self.stop)
         with self.store.db() as db:
             db.execute("UPDATE takes SET status='succeeded',file=?,thumb=?,output_sha256=?,error=NULL WHERE id=?",
-                       (str(output.relative_to(self.store.root)), str(thumb.relative_to(self.store.root)), hashlib.sha256(output.read_bytes()).hexdigest(), take_id))
+                       (output.relative_to(self.store.root).as_posix(), thumb.relative_to(self.store.root).as_posix(), hashlib.sha256(output.read_bytes()).hexdigest(), take_id))
             # The first completed take is selected automatically; a retake
             # never silently replaces an already selected take or master.
             db.execute("INSERT OR IGNORE INTO selections VALUES(?,?,?)", (take["project_id"], take["cut_id"], take_id))
             db.execute("UPDATE projects SET version=version+1,updated=? WHERE id=?", (now(), take["project_id"]))
+
+    def persist_external_id(self, take, external_id):
+        # A small independent journal survives a failed SQLite write. It is
+        # tied to the exact frozen input, so it cannot resume another take.
+        target = self.store.root / "takes" / take["id"] / "remote-job.json"
+        partial = target.with_suffix(".tmp")
+        try:
+            partial.write_text(encode({"take_id": take["id"], "provider": take["provider"],
+                "input_sha256": hashlib.sha256(take["input"].encode()).hexdigest(), "external_id": external_id}), encoding="utf-8")
+            replace(partial, target)
+        except OSError:
+            logging.error("Studio remote ID journal failed: take=%s external_id=%s", take["id"], external_id)
+        finally:
+            try:
+                partial.unlink(missing_ok=True)
+            except OSError:
+                logging.warning("Studio remote ID journal temporary file cleanup failed")
+        try:
+            with self.store.db() as db:
+                db.execute("UPDATE takes SET status='running',external_id=? WHERE id=?", (external_id, take["id"]))
+        except (sqlite3.Error, OSError) as exc:
+            logging.error("Studio remote ID database save failed: take=%s external_id=%s", take["id"], external_id)
+            raise RuntimeError(f"受付済みジョブID {external_id} の保存に失敗しました。再投入前に生成先と保存先を確認してください") from exc
 
     def render(self, job_id, project_id, manifest):
         self.update(job_id, stage="30秒動画を合成中", progress=92)
@@ -590,8 +659,8 @@ class Worker:
             manifest = {**manifest, "metadata": metadata, "created": now()}
             (folder / "manifest.json").write_text(encode(manifest), encoding="utf-8")
             with self.store.db() as db:
-                db.execute("INSERT INTO renders VALUES(?,?,?,?,?,?,?)", (ident, project_id, revision, str(output.relative_to(self.store.root)),
-                           str((folder / "cover.jpg").relative_to(self.store.root)), encode(manifest), now()))
+                db.execute("INSERT INTO renders VALUES(?,?,?,?,?,?,?)", (ident, project_id, revision, output.relative_to(self.store.root).as_posix(),
+                           (folder / "cover.jpg").relative_to(self.store.root).as_posix(), encode(manifest), now()))
                 db.execute("UPDATE projects SET version=version+1,updated=? WHERE id=?", (now(), project_id))
         except Exception:
             shutil.rmtree(folder, ignore_errors=True)

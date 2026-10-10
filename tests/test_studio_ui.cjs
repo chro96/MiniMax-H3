@@ -33,6 +33,28 @@ function ui() {
 
 const a = "a".repeat(32), b = "b".repeat(32);
 
+test("ComfyUI generation confirmation retains the chosen backend and cut", async () => {
+  const app = ui();
+  app.run(`state.provider="comfy";state.project={id:"${a}",version:7,document:{cuts:[{id:"${b}",title:"cut",seconds:6,description_ja:"memo"}]},prompts:{"${b}":"H3 prompt"}};
+    modal=(title,body)=>{globalThis.confirmation=body;};`);
+  await app.run(`generate(["${b}"])`);
+  assert.equal(app.run("state.pending.provider"), "comfy");
+  assert.equal(app.run("state.pending.version"), 7);
+  assert.equal(app.run("state.pending.cut_ids[0]"), b);
+  assert.match(app.run("confirmation"), /ComfyUI H3/);
+  assert.match(app.run("confirmation"), /H3 prompt/);
+});
+
+test("connection without a workflow asks for the working API workflow", async () => {
+  const app = ui();
+  app.run("api=async()=>({missing_nodes:{},configuration:{workflow_counts:[]}});");
+  await app.run("handleAction('check-comfy',{})");
+  assert.match(app.run("$('#comfy-check-result').textContent"), /ワークフローを読み込んで/);
+  app.run("api=async()=>({missing_nodes:{'1':['CustomGGUF']},configuration:{workflow_counts:[1]}});");
+  await app.run("handleAction('check-comfy',{})");
+  assert.match(app.run("$('#comfy-check-result').textContent"), /参照1枚用: CustomGGUF/);
+});
+
 test("editing during save persists the newer draft at the returned version", async () => {
   const app = ui();
   app.run(`state.project={id:"${a}",version:1,document:{title:"first",cuts:[]}};state.dirty=true;

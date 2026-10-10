@@ -4,6 +4,7 @@ const $ = (selector) => document.querySelector(selector);
 const escapeHTML = (value) => String(value ?? "").replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const labels = {draft:"コマ割り作成",generating:"処理中",assembly:"合成待ち",review:"レビュー待ち",approved:"承認済み",archived:"アーカイブ",queued:"待機中",running:"処理中",succeeded:"完了",failed:"失敗"};
 const fieldNames = {visual:"映像・構図",action:"動き",camera:"カメラ",end_state:"終端状態",sound:"効果音",dialogue:"セリフ"};
+const providerNames = {h3:"MiniMax H3 (SGLang)",comfy:"ComfyUI H3",demo:"デモ"};
 const state = {config:null,library:[],project:null,dirty:false,filter:"all",query:"",provider:"h3",busy:false,pending:null,upload:null,modalTake:null};
 let toastTimer;
 let operations = Promise.resolve();
@@ -125,7 +126,8 @@ function renderProject() {
       <section class="panel sticky-panel"><div class="panel-title"><h3>完成版プレビュー</h3>${latest?`<span class="help">r${latest.revision}</span>`:""}</div>
         ${latest ? `<video class="player" controls preload="metadata" src="${latest.url}" poster="${latest.cover_url}"></video><div class="render-meta"><strong>${latest.manifest.demo?"DEMO · 操作検証用動画":"30秒 · 24fps"}</strong><div class="help">${latest.manifest.takes.map((t,i)=>`${i+1}:r${t.revision}`).join(" / ")}</div></div>${p.master_current?badge("review","現在の構成と一致"):badge("stale","構成を更新済み・再合成が必要")}` : `<div class="player-placeholder">30秒の物語が、ここに。<br>全カットを生成して合成すると<br>完成版を再生できます。</div>`}
         <div class="notice ${state.provider==="demo"?"warning":""}">${state.provider==="demo"?"デモは色付きのテスト映像を作ります。AI映像の生成・GPUの利用はありません。":"H3サーバーでカットを順に生成します。新しいテイクの採用と完成版への反映は画面から行えます。"}</div>
-        <label class="field">生成先<select id="provider" ${active()?"disabled":""}><option value="h3" ${state.provider==="h3"?"selected":""}>MiniMax H3</option><option value="demo" ${state.provider==="demo"?"selected":""}>デモ（GPUなし・操作検証）</option></select></label>
+        <label class="field">生成先<select id="provider" ${active()?"disabled":""}><option value="comfy" ${state.provider==="comfy"?"selected":""}>ComfyUI H3（既存のワークフロー）</option><option value="h3" ${state.provider==="h3"?"selected":""}>MiniMax H3 (SGLang)</option><option value="demo" ${state.provider==="demo"?"selected":""}>デモ（GPUなし・操作検証）</option></select></label>
+        ${state.provider==="comfy"?`<p class="help">動作済みワークフローのモデル・解像度・推論設定を使います。完成版は指定比率に合わせて合成します。</p>`:""}
         <p class="help">一致テイク ${p.ready_count} / ${cuts.length}</p>
         <div class="actions">${button("generate-all","全カットを生成","",!canEdit,"primary full-width")}${button("generate-stale","不一致・未生成だけ生成","",!canEdit,"full-width")}${button("assemble","選択したテイクで合成","",!canEdit||p.ready_count!==cuts.length,"light full-width")}</div>
         <p class="help">合成は追加のAI生成を行いません。撮り直しでは既存の使用テイクと完成版を維持します。</p>
@@ -234,7 +236,7 @@ async function generate(cutIds) {
   await save();
   const cuts=state.project.document.cuts.filter((c)=>cutIds.includes(c.id));
   state.pending={cut_ids:cutIds,provider:state.provider,version:state.project.version,auto_assemble:true};
-  modal("生成内容の確認",`<p>${cuts.length}カット・計 ${cuts.reduce((s,c)=>s+c.seconds,0)}秒を${state.provider==="demo"?"デモ":"MiniMax H3"}で生成します。</p><div class="notice ${state.provider==="demo"?"warning":""}">${state.provider==="demo"?"操作検証用の色付き映像です。GPUを使用しません。":"設定したH3サーバーに生成を投入します。GPUの稼働時間が発生します。"}</div>${cuts.map((c)=>`<div class="proposal-row"><h3>${escapeHTML(c.title)} · ${c.seconds}s</h3><p>${escapeHTML(c.description_ja)}</p><details><summary>実投入プロンプト</summary><pre class="prompt">${escapeHTML(state.project.prompts[c.id])}</pre></details></div>`).join("")}<p class="help">最初の生成では完了テイクを自動選択し、全カットがそろうと合成します。撮り直したテイクは履歴から選択して反映します。</p>`,`${button("close-modal","戻る")}${button("confirm-generate","生成を開始","",false,"primary")}`);
+  modal("生成内容の確認",`<p>${cuts.length}カット・計 ${cuts.reduce((s,c)=>s+c.seconds,0)}秒を${providerNames[state.provider]}で生成します。</p><div class="notice ${state.provider==="demo"?"warning":""}">${state.provider==="demo"?"操作検証用の色付き映像です。GPUを使用しません。":state.provider==="comfy"?"読み込んだワークフローでComfyUIのキューへ順番に投入します。":"設定したH3サーバーに生成を投入します。"}</div>${cuts.map((c)=>`<div class="proposal-row"><h3>${escapeHTML(c.title)} · ${c.seconds}s</h3><p>${escapeHTML(c.description_ja)}</p><details><summary>実投入プロンプト</summary><pre class="prompt">${escapeHTML(state.project.prompts[c.id])}</pre></details></div>`).join("")}<p class="help">最初の生成では完了テイクを自動選択し、全カットがそろうと合成します。撮り直したテイクは履歴から選択して反映します。</p>`,`${button("close-modal","戻る")}${button("confirm-generate","生成を開始","",false,"primary")}`);
 }
 
 async function enqueue(action, options={}) {
@@ -244,7 +246,9 @@ async function enqueue(action, options={}) {
 
 function settings() {
   modal("生成環境の設定",`<p class="subtitle">設定はプロジェクトルートの .env.studio に保存し、Studioを再起動すると読み込まれます。</p>
-    <h3>動画生成サーバー</h3><p class="help">テキスト生成（FL2VAサーバー）</p><pre class="prompt">H3_BASE_URL=${escapeHTML(state.config.h3_base_url)}</pre><p class="help">キャラクター・コマ画像の参照生成（Ref2VAサーバー）</p><pre class="prompt">H3_REF_BASE_URL=${escapeHTML(state.config.h3_ref_base_url)}</pre><p class="help">画像はデータとして送信します。別のGPUマシンでも使用できます。</p>
+    <h3>ComfyUIで動作済みのH3を使う</h3><pre class="prompt">COMFYUI_BASE_URL=${escapeHTML(state.config.comfy?.base_url||"http://127.0.0.1:8188")}</pre><p class="help">ComfyUIで生成できたワークフローを「Export (API)」で保存し、ここで読み込みます。モデル・解像度・stepsなどを保持し、各カットのプロンプト・尺・seedを差し替えます。</p><p class="help">読込済み：${(state.config.comfy?.workflow_counts||[]).map((n)=>n?`参照画像${n}枚用`:"テキスト生成用").join(" / ")||"未設定"}</p>${(state.config.comfy?.errors||[]).map((error)=>`<p class="preformatted">${escapeHTML(error)}</p>`).join("")}<div class="actions">${button("upload-comfy","APIワークフローを読み込む","",false,"small")}${button("check-comfy","接続を確認","",false,"small")}</div><p class="help" id="comfy-check-result">カスタムノードで入力を自動判別できない場合は、docs/studio.mdのbindings例で入力先を指定します。参照生成用は画像数ごとに読み込めます。</p>
+    ${(state.config.comfy?.history||[]).length?`<details><summary>以前のワークフローに戻す</summary>${state.config.comfy.history.map((entry)=>`<div class="actions"><span class="help">${entry.reference_count?`参照画像${entry.reference_count}枚用`:"テキスト生成用"} · ${escapeHTML(entry.id.slice(-8))}</span>${button("restore-comfy","この設定に戻す",`data-history="${escapeHTML(entry.id)}"`,false,"small")}</div>`).join("")}</details>`:""}
+    <details><summary>SGLangのH3サーバー</summary><p class="help">テキスト生成（FL2VAサーバー）</p><pre class="prompt">H3_BASE_URL=${escapeHTML(state.config.h3_base_url)}</pre><p class="help">参照生成（Ref2VAサーバー）</p><pre class="prompt">H3_REF_BASE_URL=${escapeHTML(state.config.h3_ref_base_url)}</pre></details>
     <h3>AIコマ割り・部分修正</h3><p class="help">${state.config.llm_available?"接続設定あり":"現在は未設定"}。Chat Completions互換のテキストモデルを指定してください。</p><pre class="prompt">STUDIO_LLM_BASE_URL=http://127.0.0.1:8000/v1\nSTUDIO_LLM_MODEL=your-text-model\nSTUDIO_LLM_API_KEY=</pre><p class="help">AI提案の内容を確認して反映すると、H3用の英語本文も更新されます。APIキーは画面へ表示しません。詳しい起動方法は docs/studio.md を参照してください。</p>`,button("close-modal","閉じる"));
 }
 
@@ -287,6 +291,17 @@ async function handleAction(action, node) {
     case "new":newProject();break;
     case "close-modal":closeModal();break;
     case "settings":settings();break;
+    case "upload-comfy":$("#comfy-upload").value="";$("#comfy-upload").click();break;
+    case "restore-comfy":{
+      const result=await api("/api/comfy/restore",{history_id:node.dataset.history});
+      state.config.comfy=result.configuration;settings();toast("以前のワークフロー設定に戻しました");break;
+    }
+    case "check-comfy":{
+      const result=await api("/api/comfy/check");
+      const missing=Object.entries(result.missing_nodes).map(([count,nodes])=>`${count==="0"?"テキスト生成":`参照${count}枚用`}: ${nodes.join(", ")}`);
+      $("#comfy-check-result").textContent=missing.length?`接続できました。ワークフローに必要なノードがありません：${missing.join(" / ")}`:result.configuration.workflow_counts.length?"ComfyUIに接続できました。読込済みワークフローのノードを確認しました。":"ComfyUIに接続できました。動作済みのAPIワークフローを読み込んでください。";
+      break;
+    }
     case "create":{
       const project=await api("/api/projects",{title:$("#new-title").value,brief:$("#new-brief").value,layout:$("#new-layout").value,aspect_ratio:$("#new-aspect").value});
       closeModal();location.hash=`project/${project.id}`;break;
@@ -352,6 +367,14 @@ document.addEventListener("input",(event)=>{
 document.addEventListener("change",(event)=>{
   if(event.target.id==="provider"){state.provider=event.target.value;render();}
 });
+$("#comfy-upload").addEventListener("change",(event)=>runOperation(async()=>{
+  const file=event.target.files[0];if(!file)return;
+  if(file.size>2*1024*1024)throw new Error("ComfyUIワークフローは2MBまでです");
+  const value=JSON.parse(await file.text());
+  const result=await api("/api/comfy/workflow",{workflow:value});
+  state.config.comfy=result.configuration;state.provider="comfy";render();settings();
+  toast(`${result.reference_count?`参照画像${result.reference_count}枚用`:"テキスト生成用"}ワークフローを保存しました`);
+}));
 $("#asset-upload").addEventListener("change",(event)=>runOperation(async()=>{
   const file=event.target.files[0];if(!file)return;
   try{
@@ -385,5 +408,5 @@ $("#modal").addEventListener("click",(event)=>{if(!state.busy&&event.target===$(
 $("#modal").addEventListener("cancel",(event)=>{if(state.busy)event.preventDefault();else state.pending=null;});
 
 (async()=>{
-  try{state.config=await api("/api/config");await runOperation(route);setInterval(()=>refresh().catch(()=>{}),2500);}catch(error){$("#app").textContent=error.message;}
+  try{state.config=await api("/api/config");state.provider=state.config.default_provider;await runOperation(route);setInterval(()=>refresh().catch(()=>{}),2500);}catch(error){$("#app").textContent=error.message;}
 })();
