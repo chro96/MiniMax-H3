@@ -53,6 +53,8 @@ COMFYUI_POLL_SECONDS=3
 COMFYUI_TIMEOUT_SECONDS=7200
 ```
 
+ComfyUIをLinuxのGPUマシンに置き、Mac上のStudioからLANで接続する構成も同じ設定で動きます。RTX 3060 12GB / RAM 32GBのWindows PCで、共通チューニングを入れたうえで12GBで実用になる構成を計測しながら探し、必要なときだけUbuntuへ移行する手順は [docs/rtx3060-h3-tuning-plan.md](rtx3060-h3-tuning-plan.md) にまとめています。
+
 Studioは[ComfyUI公式のHTTP API](https://docs.comfy.org/development/comfyui-server/comms_routes)の `/prompt`、`/history/{prompt_id}`、`/queue`、`/view`、`/upload/image` を使います。各カットを順に投入し、結果をStudioの保存先へコピーします。WebM/AV1などの出力も、プレビュー用のH.264/AAC MP4へ変換して保存します。
 
 [標準のMiniMax H3ノード](https://github.com/Comfy-Org/ComfyUI/blob/master/comfy_extras/nodes_minimax_h3.py)ではプロンプト・フレーム数・seed・動画保存先を自動検出します。24fpsでカットの尺を満たす `17k+5` フレームへ切り上げ、合成時に各カットを指定フレーム数へ切り詰めます。幅・高さは動作済みワークフローの値を保持します。最終動画はプロジェクトの比率へフィットするため、ワークフローと異なる比率なら余白が入ります。
