@@ -1,15 +1,15 @@
 # RTX 3060 12GB Windows PC を Ubuntu 化して H3 を速くする計画
 
-作成: 2026-11-01。対象は RTX 3060 12GB / RAM 32GB の Windows PC で、ComfyUI 上の MiniMax H3 を Studio の生成先として使っている構成。GPU を買い替える前に、**質を落とさない施策から順に、1 つずつ A/B で確認しながら**速度を上げるための手順書。
+作成: 2026-11-01。対象は RTX 3060 12GB / RAM 32GB の Windows PC で、ComfyUI 上の MiniMax H3 を Studio の生成先として使っている構成。GPU を買い替える前に、**12GB で実用になる「塩梅」を見つけ、その点を計測しながら詰める**ための手順書。
 
 ## 0. 先に結論
 
 | 問い | 答え |
 |---|---|
 | Windows より Ubuntu の方が有利か | **有利。ただし「Ubuntu にしただけで速くなる」のは一部**。Ubuntu が必須なのは gpu-unlock（Linux 専用カーネルモジュール）と、SageAttention / Triton 系のビルドの摩擦が無いこと、VRAM の予約が少なく 12GB をフルに使えること。速度の大半は後述の H3 向けチューニングから来る |
-| 前回の「3060 で 1.5〜2 倍」メモは使えるか | **そのままは使えない**。あれは Wan 2.2（14B / 5B）のレシピ。このリポジトリの H3 は DiT が 33B（BF16 66GB）、テキストエンコーダが Qwen3-VL 32B（BF16 51GB）で、12GB には何をどうやっても収まらない。「5B を fp16 で素直に回す」という逃げ道が H3 には無い。Lightning LoRA の代わりは Comfy-Org 公式の Turbo LoRA と FastH3 蒸留チェックポイント |
-| 12GB で速度を決める要因 | **VRAM に載らない重みを毎ステップ PCIe 越しに流す量**。計算速度より「1 ステップあたり何 GB をストリーミングしているか」が支配的。だから VRAM を 1GB 空ける施策は、質を一切変えずに速度へ直結する |
-| 進め方 | Windows で基準を記録 → Ubuntu 導入 → 同一設定で同一出力を確認 → 無劣化の施策を 1 つずつ → 近似の施策を計測つきで → 意図的に質を落とす施策は用途別プロファイルとして分離 |
+| 「3060 で 1.5〜2 倍」のメモは使えるか | **そのままは使えない**。あれは Wan 2.2（14B / 5B）のレシピ。このリポジトリの H3 は DiT が 33B（BF16 66GB）、テキストエンコーダが Qwen3-VL 32B（BF16 51GB）で、12GB には何をどうやっても収まらない。「5B を fp16 で素直に回す」という逃げ道が H3 には無い。Lightning LoRA の代わりは Comfy-Org 公式の Turbo LoRA と FastH3 蒸留チェックポイント |
+| 12GB / 32GB で「無劣化構成」は使えるか | **使えない**。pruned int8 をベースのステップ数で回す構成は、この機材では速度が出ず本番運用に耐えない。本番構成は量子化と Turbo を含む妥協点になる前提で計画する。無劣化構成は**品質の物差しとして一度だけ回す**サンプルに使う |
+| 進め方 | Windows で基準を記録 → Ubuntu 導入 → **どの構成でも効く共通チューニングを先に全部入れる** → 量子化 × ステップ × 解像度の「塩梅」を探す → 決めた点で個別チューニング |
 
 ## 1. 前提の整理
 
@@ -19,13 +19,21 @@
 - RAM: 32GB。DiT とテキストエンコーダを同時に RAM へ置けないので、ComfyUI がモデルを順番に入れ替える前提
 - PCIe: 世代とレーン数を Phase 0 で確認する（3.0 x16 と 4.0 x16 でストリーミング速度が倍違う）
 
-### 1.2 H3 の重みと 12GB で選べる範囲
+### 1.2 12GB で速度を決めるもの
+
+VRAM に載らない重みを**毎ステップ PCIe 越しに流す量**が支配的。計算が速くなっても効きにくく、VRAM を 1GB 空けると質を変えずに速度が上がる。速度を決める軸は 3 つで、塩梅探しはこの 3 軸の探索になる:
+
+1. **DiT のサイズ**（量子化の段階）— ストリーミング量を決める
+2. **ステップ数**（ベース vs Turbo 8 / 4）— ストリーミングの回数を決める
+3. **解像度 × フレーム数**— 1 ステップの計算量と VAE デコードの VRAM を決める
+
+### 1.3 H3 の重みと 12GB で選べる範囲
 
 Comfy-Org 公式（`Comfy-Org/MiniMax-H3`）とコミュニティの主な選択肢。サイズはファイルサイズ。
 
 | 部品 | 候補 | サイズ | 備考 |
 |---|---|---|---|
-| DiT | `minimax_h3_fl2va_pruned_int8_convrot` | 21.0GB | 公式。pruned の中では最も質が良いとされる量子化。12GB には載らず約 10GB をストリーミング |
+| DiT | `minimax_h3_fl2va_pruned_int8_convrot` | 21.0GB | 公式。pruned の中では最も質が良いとされる量子化。約 10GB をストリーミング。**物差し用** |
 | DiT | `minimax_h3_fl2va_pruned_w6a8` | 16.0GB | 公式。int8 より軽く、やや劣化 |
 | DiT | `minimax_h3_fl2va_pruned_fp8_scaled` | 21.0GB | 公式。Ampere では fp8 の利点が無いので候補から外す |
 | DiT | `MiniMax-H3-FL2VA-Pruned-Q5_K_M.gguf` | 14.1GB | コミュニティ（Abiray）。ComfyUI-GGUF が必要 |
@@ -36,37 +44,51 @@ Comfy-Org 公式（`Comfy-Org/MiniMax-H3`）とコミュニティの主な選択
 | テキストエンコーダ | `qwen3vl_32b_minimax_h3_int8_convrot` | 27.1GB | RAM 32GB では OS と合わせて危険。RAM 64GB 化したときの候補 |
 | 動画 VAE | `minimax_h3_video_vae_fp16` / `_int8_convrot` | 5.2GB / 2.8GB | int8 版は kijai の実験版。VAE デコードは 12GB で OOM しやすい箇所 |
 | 音声 VAE | `minimax_h3_audio_vae_fp32` | 0.6GB | 共通 |
-| Turbo LoRA | `minimax_h3_fl2v_turbo_8step_v1.0` / `_4step` / `ref2v_turbo_4step` | 2.0GB | 公式。意図的に質を売る施策 |
+| Turbo LoRA | `minimax_h3_fl2v_turbo_8step_v1.0` / `_4step` / `ref2v_turbo_4step` | 2.0GB | 公式。ステップ蒸留 |
 | 蒸留モデル | FastVideo FastH3 8step v2 pruned int8_convrot | — | 公式配布。T2V / FL2V のみ、Ref2VA 非対応。VSA（ブロックスパース）前提 |
 
 **pruned 自体が既に質を落とした派生**（BF16 で 66GB → 40GB）である点は意識しておく。ただし非 pruned を 12GB / 32GB で回す手段は実質無いので、ここでは pruned を「12GB での上限」として扱う。
 
-### 1.3 3060 12GB の既知の実績
+### 1.4 3060 12GB の既知の実績
 
 - 864x480 / 5 秒 / Turbo 8step で 4.5 分（Comfy-Org HF discussion #35、2026-08、int8 VAE 使用）
 - 960x544 / Turbo 4step LoRA / 5 steps で動作報告あり（同 #41）
 - 同じユーザー層がテキストエンコーダに nvfp4（int4）版を使用
 
-つまり「Turbo を使えば実用、ベースモデルの全ステップは重い」という状況。この計画は **ベースモデルの全ステップをどこまで速くできるか**（＝質を保ったまま）を主眼に置き、Turbo は最後に用途別の選択肢として置く。
+**これが塩梅探しの出発点**。この計画はここから「同じ時間でどこまで質を上げられるか」「許容時間の中で何を取るか」を決める。
 
 ## 2. 施策の分類と比較のルール
 
-### 2.1 3 つのバケツ
+### 2.1 施策は「いつ入れるか」で 3 群に分ける
 
-| バケツ | 定義 | 判定方法 | 施策 |
+| 群 | 定義 | 施策 | 入れる段階 |
 |---|---|---|---|
-| A. 無劣化 | 出力がビット一致、または同一設定の再実行で生じる揺らぎ（ノイズフロア）以下 | `--deterministic` で同 seed を回し、フレームの PSNR が無限大 or ノイズフロア以下 | OS 移行、ヘッドレス化、`--reserve-vram`、VAE タイルデコード、Chunk FeedForward、Fused Modulation、gpu-unlock |
-| B. 近似（要計測） | 設計上わずかに数値が変わる。閾値次第で見えない〜見える | 同 seed で A/B。PSNR / SSIM と目視、動き量、音声差分 | SageAttention、Sol-Attn（tau）、EasyCache、`fp16_accumulation`、量子化の段階、int8 VAE |
-| C. 意図的な劣化 | 出力の性格が変わる（ステップ蒸留・スパース化） | 用途別プロファイルとして分離し、本番には使わない or 明示的に選ぶ | Turbo LoRA、FastH3、Spectrum、解像度・尺の削減 |
+| **共通** | どの重み・ステップ数・解像度でも効く。構成を決める前に入れてしまってよい | ヘッドレス化、`--reserve-vram`、VAE タイルデコード、Chunk FeedForward、Fused Modulation、SageAttention、gpu-unlock | Phase 2 |
+| **塩梅の軸** | 速度と質のトレードオフそのもの。組み合わせで「構成」が決まる | DiT の量子化段階、ベース / Turbo 8 / Turbo 4 / FastH3、解像度・フレーム数 | Phase 3 |
+| **個別** | 決めた構成の上で効き方が変わる。構成ごとに閾値を詰める | EasyCache 閾値、Sol-Attn の tau、LoRA 強度・ステップ数の微調整、int8 VAE、`fp16_accumulation`、Spectrum | Phase 4 |
+
+共通群のうち、ヘッドレス / reserve-vram / VAE タイル / Chunk FF / Fused Modulation / gpu-unlock は出力が**ビット一致**（または設計上同等）。SageAttention だけは近似だが、H3 での劣化が小さく構成に依らず効くので共通群に入れる。
 
 ### 2.2 比較の原器
 
 - **プロンプト 3 本を固定**: (1) 人物のセリフあり（音声の質を見る）、(2) カメラと被写体が大きく動く（動きが死ぬ劣化を見る）、(3) 静的・建築/プロダクト（ディテールを見る）。Studio の実投入プロンプトから選ぶ
-- **seed 固定、解像度・フレーム数固定**（例: 768x432 相当 / 6 秒 = 149 フレーム。H3 は 17k+5 フレーム）
-- **REF**: その時点で回せる最高品質設定（pruned int8_convrot、ベースのステップ数、キャッシュ無し、SDPA）。バケツ B/C はすべて REF と比較する
-- **ノイズフロア**: 変更前に REF を 2 回回して A と A' の差を測る。これ以下の差は「無劣化」と判定する
+- **seed 固定**
+- **スモーククリップ**: 共通群の確認用。480p 級 / 2 秒（53 フレーム）。速く回して判定する
+- **本番クリップ**: 塩梅探しと個別チューニング用。Studio の実寸（6 秒 = 149 フレーム、幅・高さは現行ワークフロー値）
+- **CEILING（物差し）**: pruned int8_convrot、ベースのステップ数、キャッシュ無し、SDPA で本番クリップ 3 本を**一度だけ**生成する。一晩かかってもよい。これは本番構成ではなく、「この機材で出せる最高」のサンプル。塩梅探しの PSNR と目視はこれと比べる
+- **FLOOR**: Windows の現行構成の出力。「今より悪くなっていないか」の下限
+- **ノイズフロア**: 同じ構成を 2 回回して A と A' の差を測る。これ以下の差は「同等」と判定する
 
-### 2.3 記録する指標
+### 2.3 時間の予算
+
+塩梅を決めるには「何分までなら許せるか」が先に要る。Studio は標準 5 カット × 6 秒で、撮り直しが前提の運用なので、**1 カットあたり**で決める。初期値は仮置きで、Phase 3 の最初に見直す:
+
+| プロファイル | 用途 | 1 カットの予算（仮） |
+|---|---|---|
+| 試作 | コマ割り・構図・タイミングの確認。テイク数を稼ぐ | ≤ 5 分 |
+| 本番 | 承認する完成版の撮り直し | ≤ 15〜20 分 |
+
+### 2.4 記録する指標
 
 | 指標 | 取り方 |
 |---|---|
@@ -86,14 +108,14 @@ ffmpeg -i out.mp4 -vf "tblend=all_mode=difference,signalstats,metadata=print:key
   -f null - 2>&1 | grep -o "YAVG=[0-9.]*" | cut -d= -f2 | awk '{s+=$1} END {print s/NR}'
 ```
 
-### 2.4 記録テンプレート
+### 2.5 記録テンプレート
 
-結果はこの表に追記する（`docs/` 内か Studio のメモ欄）。1 行 1 変更で、**同時に 2 つ変えない**。
+結果はこの表に追記する。1 行 1 変更で、**同時に 2 つ変えない**（Phase 3 の塩梅探しも軸を 1 つずつ動かす）。
 
-| # | 変更 | バケツ | 時間 (s) | s/it | VRAM peak | RAM peak | PSNR vs 前段 | 動き量 | 音声 | 判定 |
-|---|---|---|---|---|---|---|---|---|---|---|
-| 0 | Windows 基準 | — | | | | | — | | | 原器 |
-| 1 | Ubuntu 同一設定 | A | | | | | | | | |
+| # | 変更 | 群 | クリップ | 時間 (s) | s/it | VRAM peak | RAM peak | PSNR vs 前段 | PSNR vs CEILING | 動き量 | 音声 | 判定 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 0 | Windows 現行（FLOOR） | — | 本番 | | | | | — | | | | 下限 |
+| 1 | Ubuntu 同一設定 | — | 本番 | | | | | | | | | |
 
 ## 3. Phase 0 — Windows で基準を記録する（移行前に必ず）
 
@@ -103,7 +125,7 @@ ffmpeg -i out.mp4 -vf "tblend=all_mode=difference,signalstats,metadata=print:key
 2. 使っているモデルファイル名とサイズを控える（`models/diffusion_models`, `text_encoders`, `vae`, `loras`）
 3. `custom_nodes/` の一覧と `pip freeze` を保存
 4. 起動オプション（`--lowvram` / `--reserve-vram` / `--use-sage-attention` 等）と ComfyUI のバージョンを控える
-5. §2.2 のプロンプト 3 本を seed 固定で生成し、時間・VRAM・RAM と PNG 連番・音声を保存。これが「0: Windows 基準」
+5. §2.2 のプロンプト 3 本を seed 固定で生成し、時間・VRAM・RAM と PNG 連番・音声を保存。これが FLOOR
 6. ハードウェア情報: `nvidia-smi -q | findstr /i "PCIe Generation Link Width"` で PCIe 世代とレーン、マザーボード型番、SSD の空き、iGPU の有無（CPU 型番）
 
 ここで保存した API JSON は、Ubuntu 側でも Studio でもそのまま使う。
@@ -112,9 +134,9 @@ ffmpeg -i out.mp4 -vf "tblend=all_mode=difference,signalstats,metadata=print:key
 
 ### 4.1 構成の決定
 
-- **デュアルブート。Windows は消さない**。Windows の ComfyUI が原器であり、Ubuntu 側で詰まったときの退避先
+- **デュアルブート。Windows は消さない**。Windows の ComfyUI が FLOOR であり、Ubuntu 側で詰まったときの退避先
 - Ubuntu 24.04 LTS
-- **Ubuntu 用に別の SSD か ≥ 500GB のパーティション**。モデルだけで int8 DiT 21GB + nvfp4 TE 15.7GB + VAE 6GB + GGUF 比較用 25GB + FastH3 + LoRA で 100GB 近くなる。Windows 側 NTFS のモデルを読むことも可能だが、ストリーミング元になるファイルは ext4 の NVMe に置く
+- **Ubuntu 用に別の SSD か ≥ 500GB のパーティション**。モデルだけで int8 DiT 21GB + nvfp4 TE 15.7GB + VAE 6GB + 塩梅探し用の GGUF / w6a8 で 50GB + FastH3 + LoRA で 100GB を超える。Windows 側 NTFS のモデルを読むことも可能だが、ストリーミング元になるファイルは ext4 の NVMe に置く
 - **ヘッドレス運用を推奨**。Studio は Mac で動かし、Ubuntu 機には SSH と ComfyUI の HTTP だけ。3060 が画面描画を持たないので VRAM が 0.5〜1GB 空き、コンポジタによるカクつきも消える。デスクトップが必要なら iGPU に画面を出す（CPU に iGPU があれば BIOS で Primary Display を iGPU に）
 
 ### 4.2 Windows 側の事前作業（ここで詰まる人が多い）
@@ -195,22 +217,23 @@ sudo systemctl enable --now comfyui
 
 ### 4.5 Phase 1 の完了条件
 
-Windows の API JSON をそのまま投入し、§2.2 の 3 本が生成できること。これが表の「1: Ubuntu 同一設定」。Windows 基準との差が、**OS 移行だけの効果**。VRAM ピークが Windows より下がっているはず（WDDM の予約分）。
+Windows の API JSON をそのまま投入し、§2.2 の 3 本が生成できること。これが表の「1: Ubuntu 同一設定」。FLOOR との差が、**OS 移行だけの効果**。VRAM ピークが Windows より下がっているはず（WDDM の予約分）。
 
-## 5. Phase 2 — 無劣化の施策（バケツ A）
+## 5. Phase 2 — 共通チューニング（構成を決める前に全部入れる）
 
-1 つ適用するごとに §2.2 の 3 本を回し、前段と PSNR 比較して記録する。判定用の実行には `--deterministic` を付け、本番では外す。順番は「安い・効く」順。
+どの重み・ステップ数でも効くものを、**スモーククリップで 1 つずつ確認しながら**まとめて入れる。ここで空いた VRAM が、Phase 3 で 1 段上の量子化や 1 段上の解像度を同じ時間で回せる余地になる。判定用の実行には `--deterministic` を付け、本番では外す。
 
 | # | 施策 | やること | 期待 | 確認 |
 |---|---|---|---|---|
 | A1 | ヘッドレス / 表示を 3060 から外す | §4.1。`nvidia-smi` で起動直後の使用量が 100MB 未満になること | VRAM 0.5〜1GB 回復 → ストリーミング量が減る | ビット一致 |
 | A2 | `--reserve-vram` の調整 | `--lowvram` は使わない。`--reserve-vram 0.5` から 0.25 刻みで下げ、OOM せず最も速い値 | 常駐できる重みが増える | ビット一致 |
-| A3 | VAE デコードのタイル化 | `VAEDecodeTiled` に差し替え。タイルサイズは大きいほど継ぎ目が出にくい | VAE デコード時の OOM / ストリーミング回避 | PSNR で継ぎ目の影響を確認（厳密にはバケツ B 寄り） |
+| A3 | VAE デコードのタイル化 | `VAEDecodeTiled` に差し替え。タイルサイズは大きいほど継ぎ目が出にくい | VAE デコード時の OOM / ストリーミング回避。本番解像度で効く | PSNR で継ぎ目の影響を確認 |
 | A4 | Chunk FeedForward | ComfyUI-sol-attn の `MiniMax H3 Chunk FeedForward` ノード | MLP のピーク VRAM −37%（作者計測）。出力はビット一致と明記 | ビット一致 |
 | A5 | Fused Modulation | 同 `MiniMax H3 Fused Modulation`。KJNodes の Low VRAM Attention とは併用不可 | 要素演算の融合。ビット一致と明記 | ビット一致 |
-| A6 | gpu-unlock | §5.1 | BF16×FP32 累算の Tensor Core レートが約 2 倍。ただし 12GB ではストリーミング律速なので全体への効果は要計測 | ビット一致（README 明記） |
+| A6 | SageAttention | `pip install sageattention==2.2.0 --no-build-isolation` → `--use-sage-attention`。H3 には KJNodes の `MiniMax H3 Memory Efficient Sage Attention Patch` も併用 | Attention の計算と VRAM を削る。**Ampere には FP8 が無いので QK は INT8、PV は FP16 の経路**。Ada 以降の倍率は出ない | PSNR vs 前段。劣化が見えたら外す |
+| A7 | gpu-unlock | §5.1 | BF16×FP32 累算の Tensor Core レートが約 2 倍。ストリーミング律速なので全体への効果は要計測。**Turbo で ステップ数が減るほど、1 ステップの計算比率が上がり効きやすくなる** | ビット一致（README 明記） |
 
-A1〜A5 で VRAM に余裕ができたら、**Phase 3 の量子化ラダーで 1 段上の量子化（int8 ← w6a8 ← Q5 ← Q4）が同じ速度で回るようになる**のが本当の狙い。「速くする」だけでなく「同じ速度でより質の高い重みを使う」方向にも使える。
+Phase 2 が終わったら、**本番クリップで Windows と同じ構成**をもう一度回して記録する。これが「共通チューニングだけでどれだけ速くなったか」の数字で、Phase 3 の出発点。
 
 ### 5.1 gpu-unlock の手順と確認
 
@@ -246,35 +269,58 @@ PY
 - 発熱は増えるが、電力制限と温度制御はそのまま効く。ベンチ中に `nvidia-smi` のクロックとスロットル理由を見ておく
 - 止めるときはカーネルパラメータを外すだけ
 
-## 6. Phase 3 — 近似の施策（バケツ B、計測つき）
+## 6. Phase 3 — 塩梅を探す（量子化 × ステップ × 解像度）
 
-ここからは数値が変わる。**REF（Phase 2 完了時点の構成）と比較して、PSNR・目視・動き量・音声の 4 点で判断する**。閾値のある施策は弱い側から入る。
+### 6.1 物差しを先に作る
 
-| # | 施策 | 設定 | 3060 での注意 |
+CEILING（pruned int8_convrot、ベースのステップ数、キャッシュ無し、SDPA）で本番クリップ 3 本を一晩回して保存する。**この構成を本番に使うつもりは無い**。Phase 3 の全部の行は、FLOOR（今の Windows）より良いか、CEILING にどれだけ近いかで見る。
+
+### 6.2 探索の進め方
+
+全組み合わせは回さない。**既知の 3060 動作点から出発し、軸を 1 つずつ「質が上がる方向」に動かして、予算（§2.3）を超えたら戻す**。
+
+```text
+出発点: pruned Q4_K_M（or w6a8） × Turbo 8step × 864x480 級   ← 3060 の実績構成
+  ├ 軸1 量子化:  Q4_K_M → Q5_K_M → w6a8 → int8_convrot   （時間と PSNR vs CEILING を記録）
+  ├ 軸2 ステップ: Turbo 8 → Turbo 8 を 10〜12 step → ベース   （Turbo LoRA はステップを増やしても使える）
+  └ 軸3 解像度:  480 級 → 544 級 → 短辺 768（H3 の学習解像度。これ以上は遅くなるだけ）
+```
+
+各軸で見るもの:
+
+| 軸 | 速度への効き方 | 質への効き方 | 3060 での注意 |
 |---|---|---|---|
-| B1 | 量子化ラダー | int8_convrot（REF）→ w6a8 → GGUF Q5_K_M → Q4_K_M。それぞれの速度と PSNR vs REF | **速いのは「VRAM に載る方」とは限らない**。GGUF は毎ステップ逆量子化のコストがあり、int8 はストリーミングのコストがある。PCIe 4.0 なら int8 が、3.0 なら GGUF が勝ちやすい。測るまで分からない |
-| B1' | pruned vs 非 pruned | 非 pruned Q3_K_M（15.6GB）vs pruned Q5_K_M（14.1GB） | 「枝刈り」と「量子化」のどちらが H3 の質を削るかの比較。RAM 32GB で両方回る |
-| B2 | SageAttention | `pip install sageattention==2.2.0 --no-build-isolation` → `--use-sage-attention`。H3 には KJNodes の `MiniMax H3 Memory Efficient Sage Attention Patch` も併用 | **Ampere には FP8 が無いので、QK は INT8、PV は FP16 の経路**。Ada 以降で報告される倍率は出ない。効果は要計測 |
-| B3 | Sol-Attn（スパース） | ComfyUI-sol-attn の `MiniMax H3 Scheduled Sol Attention Patch`。tau を低め（密）から。順序は KJ Sage → KJ H3 Sage → Sol の順が必須 | v0.6.2 で SM86 対応、3090 Ti で動作確認済み、**SM86 の性能は未計測**。作者の 5090 計測では Sage 比 1.14〜1.44 倍。誤差は相対 L2 0.008 |
-| B4 | EasyCache / LazyCache | ComfyUI 本体ノード。`reuse_threshold` を小さい値から。H3 の音声/映像の二出力に対応している | TeaCache の後継で H3 対応はこれだけ。コミュニティ報告で約 25%。**Sol の tau と EasyCache の閾値を同時に上げない**（作者も明記） |
-| B5 | `--fast fp16_accumulation` | PyTorch 2.7 以降 | 累算を FP16 にする＝精度を落とす。**gpu-unlock が効いている状態では旨味が減る**（制限されているのは FP32 累算の経路なので）。A6 の後に測って、差が無ければ外す |
-| B6 | int8 動画 VAE | `minimax_h3_video_vae_int8_convrot` | kijai の実験版。VAE デコードの VRAM を半分にするが、最終画質に直接触る部分なので PSNR を厳しめに見る |
+| 量子化 | ストリーミング量（int8 21GB → 約 10GB 流す。Q4 11.6GB → ほぼ常駐）。**GGUF は毎ステップ逆量子化のコスト、int8 は転送のコスト**で、PCIe 4.0 なら int8 が、3.0 なら GGUF が勝ちやすい | Q4 → Q5 → w6a8 → int8 の順に CEILING に近づく。拡散モデルは誤差がステップで増幅されるので Q4 以下は LLM より劣化が大きい | 試作と本番で違う量子化を使ってよい（Studio にワークフローを 2 本登録する） |
+| ステップ | ほぼ比例 | Turbo は動きの振幅とプロンプト追従が落ちる。H3 は CFG 蒸留済みなので negative は元々効かない | 公式 Turbo 8step が出発点。4step は構図確認専用。FastH3 は T2V / FL2V のみで Ref2VA 非対応、ステップ 8 固定 |
+| 解像度 | 1 ステップの計算量と VAE デコードの VRAM | 短辺 768 が学習解像度。それ以下は情報量が減るだけで「劣化」ではなく「仕様」 | 試作は 480 級で固定。本番だけ上げる |
+| pruned vs 非 pruned | — | 非 pruned Q3_K_M（15.6GB）vs pruned Q5_K_M（14.1GB）。「枝刈り」と「量子化」のどちらが H3 の質を削るか | RAM 32GB で両方回る。1 回だけ比較して方向を決める |
 
-B1 の結果が「本番用の重み」を決める。残りはその重みの上で測る。
+### 6.3 Phase 3 の成果物
 
-## 7. Phase 4 — 意図的な劣化（バケツ C、用途別プロファイル）
+次の 2 つの構成を決めて、それぞれ API JSON として Export する。
 
-本番用ではなく **試作・構図確認・テイク数を稼ぐ**ための設定として、REF と別のワークフロー JSON に分けて Studio に登録する（Studio は読み込んだワークフローの設定を保持するので、JSON を切り替えるだけで済む）。
+| プロファイル | 決め方 |
+|---|---|
+| **試作** | 予算 ≤ 5 分/カットの中で、動き量が FLOOR より落ちない最も質の高い点。おそらく Turbo 8step × 480 級 × Q4〜Q5 |
+| **本番** | 予算 ≤ 15〜20 分/カットの中で、CEILING に最も近い点。おそらく Turbo 8〜12step × 544〜768 × w6a8〜int8 |
 
-| # | 施策 | 内容 | 質のコスト |
+「本番でもベースのステップ数は使わない」という結論になる可能性が高い。それでよい。CEILING との差を数字で持っておくことが目的で、差が小さければ安心して使えるし、差が大きければ GPU 交換の根拠になる。
+
+## 7. Phase 4 — 個別チューニング（決めた構成の上で詰める）
+
+ここからは**構成ごとに閾値を詰める**。試作と本番で最適値が違う前提で、それぞれの構成で測る。**REF は各プロファイルの Phase 3 確定点**（CEILING ではない）。
+
+| # | 施策 | 設定 | 注意 |
 |---|---|---|---|
-| C1 | Turbo 8step LoRA（公式） | `LoraLoaderModelOnly` で `minimax_h3_fl2v_turbo_8step_v1.0` を読み、ステップを 8 に。Ref2VA は `ref2v_turbo_4step` | 動きの振幅とプロンプト追従が落ちる。CFG 蒸留済みモデルなので negative は元々効かない点は変わらない。3060 で 864x480 / 5 秒が 4.5 分の実績 |
-| C2 | Turbo 4step LoRA（公式） | 同上を 4〜5 step | C1 よりさらに平均化。構図確認専用 |
-| C3 | FastH3（公式配布の蒸留モデル） | `fastvideo_fasth3_8step_v2_pruned_int8_convrot` + `BlockSparseAttention`（VSA keep 10%）。ステップは 8 固定 | 公式ドキュメントが「動きと音声の忠実度を速度と交換」「Ref2VA 非対応」と明記。T2V / FL2V の試作用 |
-| C4 | Spectrum ノード | `ComfyUI-Spectrum-MiniMax-H3` | 報告が −2 倍〜+2 倍まで割れている近似加速。入れるなら同 seed で必ず A/B |
-| C5 | 解像度・尺 | 試作 480p / 49〜81 フレーム、本番だけ 768 短辺 / 実尺 | 質の劣化ではなく成果物の仕様。H3 の学習解像度は短辺 768 なので、それ以上は遅くなるだけ |
+| D1 | EasyCache / LazyCache | ComfyUI 本体ノード。`reuse_threshold` を小さい値から上げ、動き量と PSNR が崩れる手前で止める。H3 の音声/映像の二出力に対応 | TeaCache の後継で H3 対応はこれだけ。コミュニティ報告で約 25%。**Turbo 8step では飛ばせるステップが少ないので効きが小さい**。本番（ステップ多め）の方が効く |
+| D2 | Sol-Attn（スパース） | ComfyUI-sol-attn の `MiniMax H3 Scheduled Sol Attention Patch`。tau を低め（密）から。順序は KJ Sage → KJ H3 Sage → Sol の順が必須 | v0.6.2 で SM86 対応、3090 Ti で動作確認済み、**SM86 の性能は未計測**。作者の 5090 計測では Sage 比 1.14〜1.44 倍。**D1 の閾値と tau を同時に上げない**（作者も明記） |
+| D3 | Turbo の強度とステップ | LoRA 強度 1.0 → 0.8、8step → 10〜12step | 動きが死ぬ症状の緩和。本番プロファイルで試す |
+| D4 | int8 動画 VAE | `minimax_h3_video_vae_int8_convrot` | VAE デコードの VRAM を半分に。最終画質に直接触るので PSNR を厳しめに。本番解像度で OOM するなら A3 のタイル化と比較 |
+| D5 | `--fast fp16_accumulation` | PyTorch 2.7 以降 | 累算を FP16 にする＝精度を落とす。**gpu-unlock が効いていれば旨味が減る**（制限されているのは FP32 累算の経路）。差が無ければ外す |
+| D6 | Spectrum ノード | `ComfyUI-Spectrum-MiniMax-H3` | 報告が −2 倍〜+2 倍まで割れている近似加速。入れるなら同 seed で必ず A/B |
+| D7 | FastH3 | 試作プロファイルの代替候補。`fastvideo_fasth3_8step_v2_pruned_int8_convrot` + `BlockSparseAttention`（VSA keep 10%） | 公式ドキュメントが「動きと音声の忠実度を速度と交換」と明記。Turbo 8step との比較で試作用に採用するか決める |
 
-Studio 側には **「本番（REF + 無劣化 + 採用した B）」と「試作（C1 or C3）」の 2 本**を登録し、コマ割りの確認は試作、承認する完成版は本番で撮り直す運用にする。
+Studio には **試作と本番の 2 本**を登録し、コマ割りの確認は試作、承認する完成版は本番で撮り直す運用にする。Studio は読み込んだワークフローの設定を保持するので、JSON を切り替えるだけで済む。
 
 ## 8. Studio への接続
 
@@ -294,17 +340,17 @@ Studio は参照画像を `/upload/image` でアップロードするので、Ma
 |---|---|---|
 | OS 移行のみ | ±0〜15% | WDDM の VRAM 予約が無くなる分。オフロードの挙動が予測可能になる |
 | A1〜A5（VRAM 回復） | 1 ステップのストリーミング量に比例 | 空いた VRAM 分だけ PCIe 転送が減る。PCIe 3.0 ほど効く |
-| A6 gpu-unlock | 計算部は最大 2 倍、全体は要計測 | 本家 README の 3060 値は BF16 27→51 TFLOPS。動画生成の実測は +15〜20%（Wan 2.2） |
-| B2 Sage（Ampere） | 要計測 | FP8 経路が無い |
-| B3 Sol-Attn | Sage 比 1.1〜1.4 倍（5090 値） | SM86 は未計測 |
-| B4 EasyCache | 〜25% | コミュニティ報告 |
-| C1 Turbo 8step | サンプラー部で ×5 前後 | ステップ数比 |
+| A6 Sage（Ampere） | 要計測 | FP8 経路が無い |
+| A7 gpu-unlock | 計算部は最大 2 倍、全体は要計測 | 本家 README の 3060 値は BF16 27→51 TFLOPS。動画生成の実測は +15〜20%（Wan 2.2）。Turbo でステップが少ないほど効く |
+| Turbo 8step（塩梅の軸） | サンプラー部で ×5 前後 | ステップ数比 |
+| D1 EasyCache | 〜25%（ステップ多めの構成で） | コミュニティ報告 |
+| D2 Sol-Attn | Sage 比 1.1〜1.4 倍（5090 値） | SM86 は未計測 |
 
 **GPU 交換・RAM 増設の判断**は Phase 3 が終わった時点で行う:
 
-- 不満が「速度」で、Turbo を試作に使えば回る → 現状維持
-- 不満が「本番の質」で、B1 で int8_convrot が遅すぎて使えない → **まず RAM を 64GB に**（DDR4 なら安い）。int8 テキストエンコーダと重い量子化の DiT を RAM に置けるようになり、ディスクからの読み直しが消える
-- 不満が「解像度・尺・Ref2VA の質」で VRAM が根本原因 → GPU 交換。その場合もここで作った計測プロトコルと本番/試作の 2 プロファイルはそのまま使える
+- 試作プロファイルが予算内で回り、本番プロファイルの CEILING との差が許容範囲 → 現状維持
+- 本番プロファイルで int8_convrot が予算に入らず、w6a8 / Q5 と CEILING の差が気になる → **まず RAM を 64GB に**（DDR4 なら安い）。int8 テキストエンコーダと重い量子化の DiT を RAM に置けるようになり、ディスクからの読み直しが消える
+- 不満が「解像度・尺・Ref2VA の質」で VRAM が根本原因 → GPU 交換。その場合もここで作った計測プロトコルと試作 / 本番の 2 プロファイルはそのまま使える
 
 ## 10. 参考
 
