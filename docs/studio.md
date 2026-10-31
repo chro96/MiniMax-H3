@@ -53,7 +53,7 @@ COMFYUI_POLL_SECONDS=3
 COMFYUI_TIMEOUT_SECONDS=7200
 ```
 
-ComfyUIをLinuxのGPUマシンに置き、Mac上のStudioからLANで接続する構成も同じ設定で動きます。RTX 3060 12GBのWindows PCをUbuntuに移行し、共通チューニングを入れたうえで 12GB で実用になる構成を計測しながら探す手順は [docs/ubuntu-3060-tuning-plan.md](ubuntu-3060-tuning-plan.md) にまとめています。
+ComfyUIをLinuxのGPUマシンに置き、Mac上のStudioからLANで接続する構成も同じ設定で動きます。RTX 3060 12GB / RAM 32GBのWindows PCで、共通チューニングを入れたうえで12GBで実用になる構成を計測しながら探し、必要なときだけUbuntuへ移行する手順は [docs/rtx3060-h3-tuning-plan.md](rtx3060-h3-tuning-plan.md) にまとめています。
 
 Studioは[ComfyUI公式のHTTP API](https://docs.comfy.org/development/comfyui-server/comms_routes)の `/prompt`、`/history/{prompt_id}`、`/queue`、`/view`、`/upload/image` を使います。各カットを順に投入し、結果をStudioの保存先へコピーします。WebM/AV1などの出力も、プレビュー用のH.264/AAC MP4へ変換して保存します。
 
